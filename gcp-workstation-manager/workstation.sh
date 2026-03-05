@@ -15,7 +15,7 @@
 # Google Cloud Workstations CLI Manager
 # Helper script to list, start, and stop Google Cloud Workstations.
 
-VERSION="1.0.0"
+VERSION="1.1.5"
 
 set -e
 
@@ -40,7 +40,7 @@ fi
 usage() {
     echo "🚀 Google Cloud Workstations CLI Manager"
     echo ""
-    echo "Usage: $0 {setup|list|start|stop|restart|tunnel|version} [WORKSTATION_NAME]"
+    echo "Usage: $0 {setup|list|start|stop|restart|tunnel|label|version} [WORKSTATION_NAME] [OPTIONS]"
     echo ""
     echo "Commands:"
     echo "  setup                  ⚙️  Interactively configure project, region, cluster, and config."
@@ -49,6 +49,7 @@ usage() {
     echo "  stop WORKSTATION_NAME  🛑 Stop a specific workstation."
     echo "  restart WORKSTATION_NAME 🔄 Stop and then start a specific workstation."
     echo "  tunnel WORKSTATION_NAME [LOCAL_PORT] 🚇 Start a TCP tunnel (starts workstation if not running)."
+    echo "  label WORKSTATION_NAME LABELS 🏷️  Apply labels (e.g., env=dev,desc=my-demo)."
     echo "  version                🏷️  Show the version of this script."
     echo ""
     echo "Required Configuration:"
@@ -198,7 +199,7 @@ case "$COMMAND" in
         echo "📋 Listing all workstations in project '$PROJECT_ID'..."
         gcloud workstations list \
             --project="$PROJECT_ID" \
-            --format="table(name.basename():label=NAME, name.segment(3):label=REGION, name.segment(5):label=CLUSTER, name.segment(7):label=CONFIG, state:label=STATE)" | awk '
+            --format="table(name.basename():label=NAME, name.segment(3):label=REGION, name.segment(5):label=CLUSTER, name.segment(7):label=CONFIG, labels.env:label=ENV, labels.desc:label=DESC, state:label=STATE)" | awk '
             BEGIN {
                 GREEN="\033[1;32m"
                 RED="\033[1;31m"
@@ -306,6 +307,56 @@ case "$COMMAND" in
             --cluster="$CLUSTER" \
             --config="$CONFIG" \
             --local-host-port=":$LOCAL_PORT"
+        ;;
+    label)
+        if [ -z "$WORKSTATION_NAME" ]; then
+            echo "❌ Error: WORKSTATION_NAME is required for 'label'."
+            usage
+        fi
+        LABELS=$3
+        if [ -z "$LABELS" ]; then
+            echo "❌ Error: LABELS are required (e.g., env=dev,desc=demo)."
+            usage
+        fi
+
+        # Sanitize labels for Google Cloud (lowercase, no spaces, hyphens/underscores only)
+        # 1. Lowercase everything
+        # 2. Replace spaces with hyphens
+        # 3. Strip any other character not in a-z0-9,=_ or hyphen
+        SANITIZED_LABELS=$(echo "$LABELS" | tr '[:upper:]' '[:lower:]' | sed 's/ /-/g' | sed 's/[^a-z0-9,=_-]//g')
+        # Ensure it doesn't have double hyphens
+        SANITIZED_LABELS=$(echo "$SANITIZED_LABELS" | sed 's/--/-/g')
+        
+        if [ "$LABELS" != "$SANITIZED_LABELS" ]; then
+            echo "⚠️  Labels sanitized to meet Google Cloud requirements: '$SANITIZED_LABELS'"
+            LABELS=$SANITIZED_LABELS
+        fi
+
+        resolve_workstation_details "$WORKSTATION_NAME"
+        echo "🏷️  Applying labels '$LABELS' to workstation '$WORKSTATION_NAME'..."
+        # Parse labels into JSON (e.g. from "env=dev,desc=demo" to '{"env":"dev","desc":"demo"}')
+        JSON_LABELS=$(echo "$LABELS" | awk -F, 'BEGIN { printf "{" } {
+            for(i=1; i<=NF; i++) {
+                split($i, a, "=");
+                printf "\"%s\":\"%s\"", a[1], a[2];
+                if (i < NF) printf ",";
+            }
+        } END { printf "}" }')
+
+        # Use REST API to update labels since gcloud workstations update does not exist
+        TOKEN=$(gcloud auth print-access-token)
+        RESPONSE=$(curl -s -X PATCH -H "Authorization: Bearer $TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "{\"labels\": $JSON_LABELS}" \
+            "https://workstations.googleapis.com/v1/projects/$PROJECT_ID/locations/$REGION/workstationClusters/$CLUSTER/workstationConfigs/$CONFIG/workstations/$WORKSTATION_NAME?updateMask=labels")
+        
+        if echo "$RESPONSE" | grep -q "\"name\":"; then
+            echo "✅ Labels applied successfully."
+        else
+            echo "❌ Failed to update labels. API response:"
+            echo "$RESPONSE"
+            exit 1
+        fi
         ;;
     restart)
         if [ -z "$WORKSTATION_NAME" ]; then
